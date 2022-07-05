@@ -49,8 +49,8 @@ func addArticleToDB(newArticle Article) error {
 
 func main() {
 	Database = redis.NewClient(&redis.Options{
-		Addr:     "redis-17969.c57.us-east-1-4.ec2.cloud.redislabs.com:17969",
-		Password: "dYrmsiPgAt5aDuB3Eo9KTld0HS1lSuKX",
+		Addr:     "localhost:49153",
+		Password: "redispw",
 		DB:       0,
 	})
 	var emptyArticleList ArticleList

@@ -3,16 +3,21 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/gocolly/colly"
 )
 
-type ArticleList struct {
-	Articles []Article `json:"articles"`
-}
+var (
+	EndOfArticles bool   = false
+	PublicKey     string = "0x02fb51a24a56b1cd7776850b74ce9d7c8caca7c650b2ea6b54a9593b6ecf745e1a"
+	Database      *redis.Client
+)
 
 type Article struct {
 	Title   string `json:"title"`
@@ -20,87 +25,89 @@ type Article struct {
 	Date    string `json:"date"`
 }
 
-var (
-	Database      *redis.Client
-	EndOfArticles bool = false
-)
-
-func addArticleToDB(newArticle Article) error {
-	articles, err := Database.Get("articles").Result()
+// Adding article into the database using url as the key
+//
+// This function will process the article data into json string and store the url and that
+// json string as a pair of key-value and then record the url into the key "theblock"
+func AddTheBlockArticleToDB(url string, newArticle Article) error {
+	time, err := time.Parse("January 2, 2006, 3:4PM", newArticle.Date)
 	if err != nil {
-		fmt.Println(err)
 		return err
 	}
-	var articleList ArticleList
-	err = json.Unmarshal([]byte(articles), &articleList)
+	score := -time.Unix()
+	jsonBytes, err := json.Marshal(newArticle)
 	if err != nil {
-		fmt.Println(err)
 		return err
 	}
-	articleList.Articles = append(articleList.Articles, newArticle)
-	jsonString, err := json.Marshal(articleList)
+	jsonString := string(jsonBytes)
+	Database.Set(url, jsonString, 0)
+	member := redis.Z{
+		Score:  float64(score),
+		Member: url,
+	}
+	err = Database.ZAdd("theblock", member).Err()
 	if err != nil {
-		fmt.Println(err)
 		return err
 	}
-	Database.Set("articles", jsonString, 0)
-	return err
+	return nil
 }
 
-func main() {
-	Database = redis.NewClient(&redis.Options{
-		Addr:     "localhost:49153",
-		Password: "redispw",
-		DB:       0,
-	})
-	var emptyArticleList ArticleList
-	jsonString, err := json.Marshal(emptyArticleList)
-	if err != nil {
-		fmt.Println(err)
-	}
-	Database.Set("articles", jsonString, 0)
-
+// Create a new crawler for www.theblock.co
+func NewTheBlockCrawler() *colly.Collector {
 	c := colly.NewCollector(
-		colly.AllowedDomains("www.theblock.co"),
 		colly.Async(true),
+		colly.AllowedDomains("www.theblock.co"),
 	)
 
-	c.OnHTML("div.collectionLatest", func(e *colly.HTMLElement) {
-		// Extract the link from the anchor HTML element
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "www.theblock.co",
+		Parallelism: 100,
+		RandomDelay: 5 * time.Second,
+	})
+
+	c.WithTransport(&http.Transport{
+		DisableKeepAlives: true,
+	})
+
+	// Handle "theblock.co/latest" pages
+	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		if strings.Contains(e.Request.URL.String(), "https://www.theblock.co/latest") {
-			e.ForEach("a[href]", func(index int, e *colly.HTMLElement) {
-				link := e.Attr("href")
-				if strings.Contains(link, "/post") {
-					c.Visit(e.Request.AbsoluteURL(link))
-				}
-			})
+			link := e.Attr("href")
+			if strings.Contains(link, "/post") {
+				c.Visit(e.Request.AbsoluteURL(link))
+			}
 		}
 	})
 
-	c.OnHTML("dev.next inactive", func(e *colly.HTMLElement) {
-		EndOfArticles = true
-	})
-
-	c.OnHTML("article.articleBody", func(e *colly.HTMLElement) {
+	// Handle "theblock.co/post" pages
+	c.OnHTML(".articleBody", func(e *colly.HTMLElement) {
 		if strings.Contains(e.Request.URL.String(), "https://www.theblock.co/post") {
-			var article Article
+			var newArticle Article
+
 			// Handle article title
-			title := e.ChildText("h1[data-v-6ce9c252]")
-			article.Title = title
+			title := e.ChildText("h1")
+			newArticle.Title = title
+
 			// Handle article
 			content := ""
 			e.ForEach("p", func(index int, e *colly.HTMLElement) {
 				content += e.Text
 			})
-			article.Content = content
+			newArticle.Content = content
+
 			// Handle date
-			e.ForEach("div.articleMeta", func(index int, e *colly.HTMLElement) {
-				date := strings.Split(e.Text, "\n")[1][9:]
+			e.ForEachWithBreak(".articleMeta", func(index int, e *colly.HTMLElement) bool {
+				date := strings.Split(e.Text, "\n")[1]
+				date = date[9 : len(date)-4]
 				date = strings.Trim(date, " ")
-				article.Date = date
+				newArticle.Date = date
+				return false
 			})
-			if len(article.Content) != 0 && len(article.Title) != 0 && len(article.Date) != 0 {
-				addArticleToDB(article)
+
+			// Adding article to database
+			err := AddTheBlockArticleToDB(e.Request.URL.String(), newArticle)
+			if err != nil {
+				log.Fatal(err)
 			}
 		}
 	})
@@ -109,15 +116,45 @@ func main() {
 		fmt.Println("Visiting", r.URL)
 	})
 
+	return c
+}
+
+// Creating post with an account using a number of newest crawled articles
+func CreatePost(pubKey string, number int) {
+	// Do something with the public key and get username
+	user := "The Block"
+	urls, err := Database.ZRange("theblock", 0, int64(number)-1).Result()
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, url := range urls {
+		articleJsonString, err := Database.Get(url).Result()
+		if err != nil {
+			log.Fatal(err)
+		}
+		var article Article
+		json.Unmarshal([]byte(articleJsonString), &article)
+		fmt.Println("User:", user)
+		fmt.Println("Title:", article.Title)
+		fmt.Println("Content:", article.Content)
+	}
+}
+
+func main() {
+	Database = redis.NewClient(&redis.Options{
+		Addr:     "localhost:49153",
+		Password: "redispw",
+		DB:       0,
+	})
+
+	c := NewTheBlockCrawler()
+
 	page := 0
-	for !EndOfArticles {
+	for page < 100 {
 		c.Visit("https://www.theblock.co/latest?start=" + strconv.Itoa(page*10))
 		page++
-		// Need further adjustment
-		if page == 100 {
-			EndOfArticles = true
-		}
 	}
-
 	c.Wait()
+
+	CreatePost(PublicKey, 10)
 }

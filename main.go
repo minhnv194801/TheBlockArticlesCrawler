@@ -20,9 +20,10 @@ var (
 )
 
 type Article struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Date    string `json:"date"`
+	Title    string `json:"title"`
+	ImageURL string `json:"image"`
+	Content  string `json:"content"`
+	Date     string `json:"date"`
 }
 
 // Adding article into the database using url as the key
@@ -88,6 +89,13 @@ func NewTheBlockCrawler() *colly.Collector {
 			title := e.ChildText("h1")
 			newArticle.Title = title
 
+			// Handle article image
+			e.ForEachWithBreak("img[src]", func(index int, e *colly.HTMLElement) bool {
+				image := e.Attr("src")
+				newArticle.ImageURL = image
+				return false
+			})
+
 			// Handle article
 			content := ""
 			e.ForEach("p", func(index int, e *colly.HTMLElement) {
@@ -137,6 +145,7 @@ func CreatePost(pubKey string, number int) {
 		fmt.Println("User:", user)
 		fmt.Println("Title:", article.Title)
 		fmt.Println("Content:", article.Content)
+		fmt.Println("Image:", article.ImageURL)
 	}
 }
 
